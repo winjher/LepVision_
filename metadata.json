@@ -1,0 +1,6 @@
+{
+  "name": "Butterfly Pupae Shop & AI Classification Hub",
+  "description": "Production-grade Google Apps Script fix, Drive directory auto-provisioning, CNN token configuration, and interactive butterfly classification suite.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,1227 @@
+/**
+ * Butterfly Pupae Shop & Park – Code.gs (v4, complete)
+ *
+ * Script properties (Project Settings > Script properties):
+ *   BOOTSTRAP_ACCOUNTS  JSON list of admin / farm owner accounts created on first login
+ *   ADMIN_KEY           used only by the ?fn=diag setup check
+ *   CNN_API_URL         model server address, e.g. https://lepvision-api.onrender.com (no trailing slash)
+ *   CNN_API_TOKEN       must equal the API_TOKEN set on the model server
+ *   GEMINI_API_KEY      optional – friendly wording for messages
+ *   GEMINI_MODEL        optional – default gemini-2.0-flash
+ *   ROOT_FOLDER_ID      optional – Butterfly Dataset folder (Classification_v4.gs)
+ */
+
+const SHEET_ID = '1l7m8mHBNF3kY44Wi-97PIM_AGSc1aywVZK4kT3iZevc';
+const TZ = 'Asia/Manila';
+const SELF_ROLES = ['purchaser', 'buyer', 'breeder', 'enthusiast'];   // farm owners and admins are never self-registered
+const ALL_ROLES = ['purchaser', 'buyer', 'breeder', 'enthusiast', 'farmowner', 'admin'];
+const BUYER_ROLES = ['buyer', 'purchaser'];
+const ID_TYPES = ['Passport', "Driver's license", 'PhilSys ID', 'UMID', 'Postal ID', 'SSS', 'Employee ID', 'Student ID'];
+const SLOTS = ['09:00 AM - 11:00 AM', '11:00 AM - 01:00 PM', '01:00 PM - 03:00 PM', '03:00 PM - 05:00 PM'];
+const LIVE = ['Awaiting Approval', 'Pending Payment', 'Payment Submitted', 'Confirmed'];
+
+// Built-in farms. Must match the FARMS list in Index_v4.html (same names).
+// Farms created by breeder registration or the admin are stored in the farmProfiles config.
+const FARM_DEFAULTS = {
+  'JCM Butterfly Breeding Farm': {p: 150, c: 20},
+  'JCM Butterfly Farm': {p: 150, c: 20},
+  'La Anton Insects & Butterfly Farm': {p: 150, c: 20},
+  "Lorica's Butterfly Breeding Farm": {p: 150, c: 20},
+  'Lyra-Ysabelle Butterfly': {p: 150, c: 20},
+  'Marl Insects Farm': {p: 150, c: 20},
+  'Saluciana Integrated and Butterfly Farm': {p: 150, c: 20},
+  'Butterfly Paradise Farm': {p: 150, c: 20},
+  'Rainbow Wings Sanctuary': {p: 120, c: 15},
+  'Monarch Breeding Center': {p: 200, c: 12}
+};
+
+const SOON = 12 * 36e5;
+const DASH_TOKEN_SECONDS = 3600;
+
+const HDR = {
+  Users: ['username','role','name','phone','email','gcash','seen','created','lastLogin','logins','pwHash','salt','organization','address','farm','idType','idNo','mustChange'],
+  Logins: ['time','username','role','result'],
+  Activity: ['time','username','role','action','detail'],
+  Lots: ['id','breeder','species','qty','left','price','posted','expires','notes','json'],
+  Orders: ['id','buyer','breeder','species','qty','total','status','gcashRef','created','json'],
+  Reservations: ['ref','user','farm','name','phone','date','slot','visitors','total','status','gcashRef','json'],
+  Messages: ['time','ref','from','text'],
+  Config: ['key','value'],
+  Media: ['key','url','fileId'],
+  Classifications: ['Timestamp','Task','Label','Confidence','File ID','File URL','Folder URL','User']
+};
+
+// Column numbers (1-based) in the Users sheet
+const UCOL = {role: 2, name: 3, phone: 4, email: 5, gcash: 6, seen: 7, pwHash: 11, salt: 12,
+  organization: 13, address: 14, farm: 15, idType: 16, idNo: 17, mustChange: 18};
+
+let SS_CACHE = null;
+
+// ===== WEB APP ENTRY POINTS =====
+
+function doGet(e) {
+  ss_();
+  const p = (e && e.parameter) || {};
+  if (p.fn === 'ping') {
+    return ContentService.createTextOutput(JSON.stringify({result: 'pong'})).setMimeType(ContentService.MimeType.JSON);
+  }
+  if (p.fn === 'diag') {
+    return ContentService.createTextOutput(JSON.stringify(diagnose_(p.key))).setMimeType(ContentService.MimeType.JSON);
+  }
+  const isDash = p.page === 'dashboard';
+  const t = HtmlService.createTemplateFromFile(isDash ? 'Dashboard' : 'Index');
+  t.appUrl = ScriptApp.getService().getUrl();
+  // Tokens are hex only; strip anything else so the value is safe inside the page
+  t.token = String(p.token || '').replace(/[^a-f0-9]/gi, '');
+  return t.evaluate()
+    .setTitle(isDash ? 'Butterfly Shop Dashboard' : 'Butterfly Pupae Shop & Park')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, viewport-fit=cover')
+    .setXFrameOptionsMode(HtmlService.XFrameOptionsMode.ALLOWALL);
+}
+
+// Used by the GitHub Pages / Android app (JSON posts). Every name here must be a global function.
+function doPost(e) {
+  const api = {
+    login, getState, saveState, logActivity, getMedia, saveMedia, listPhotos, cnnStatus, classifyImage,
+    requestReservation, updateReservation, getMessages, sendMessage,
+    updateOwnProfile, markSeen, changeMyPassword,
+    adminListUsers, adminCreateFarmOwner, adminUpdateUser,
+    setCatalogItem, postFreshPupae, setLotLeft, placeOrder, updateOrder,
+    setFarmCapacity, updateMyFarm, adminSaveFarm,
+    classifyAndSave, datasetStatus, listButterfliesFound, exportManifest, writeLabelFiles
+  };
+  let out;
+  try {
+    const req = JSON.parse(e.postData.contents);
+    const fn = api[req.fn];
+    if (!fn) throw new Error('Unknown function: ' + req.fn);
+    out = {result: fn.apply(null, req.args || [])};
+  } catch (err) {
+    out = {error: String(err.message || err)};
+  }
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// Lists image files in Butterfly Dataset/images for the catalog.
+// Files are shared "anyone with link" so the catalog can display them.
+function listPhotos() {
+  const out = [];
+  const files = getDatasetFolder_().getFiles();
+  while (files.hasNext()) {
+    const f = files.next();
+    if (!/^image\//.test(f.getMimeType())) continue;
+    try {
+      if (f.getSharingAccess() !== DriveApp.Access.ANYONE_WITH_LINK) {
+        f.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+      }
+    } catch (e) {}
+    out.push({
+      name: f.getName(),
+      url: 'https://drive.google.com/thumbnail?id=' + f.getId() + '&sz=w800',
+      updated: f.getLastUpdated().getTime()
+    });
+  }
+  return out;
+}
+
+// ===== SHEETS =====
+
+function ss_() {
+  if (SS_CACHE) return SS_CACHE;
+  let ss = null;
+  try { ss = SpreadsheetApp.getActiveSpreadsheet(); } catch (e) {}
+  const props = PropertiesService.getScriptProperties();
+  if (!ss) {
+    const id = SHEET_ID || props.getProperty('SHEET_ID');
+    try { if (id) ss = SpreadsheetApp.openById(id); } catch (e) {}
+  }
+  if (!ss) {
+    ss = SpreadsheetApp.create('Butterfly Shop Data');
+    props.setProperty('SHEET_ID', ss.getId());
+  }
+  SS_CACHE = ss;
+  ensureTabs_(ss);
+  return ss;
+}
+
+function ensureTabs_(ss) {
+  Object.keys(HDR).forEach(name => {
+    let s = ss.getSheetByName(name);
+    if (!s) s = ss.insertSheet(name);
+    const need = HDR[name];
+    if (s.getLastRow() === 0) {
+      s.appendRow(need);
+    } else {
+      const cur = s.getRange(1, 1, 1, Math.max(s.getLastColumn(), need.length)).getValues()[0];
+      need.forEach((h, i) => { if (cur[i] !== h) s.getRange(1, i + 1).setValue(h); });
+    }
+    s.setFrozenRows(1);
+    s.getRange(1, 1, 1, need.length).setFontWeight('bold');
+  });
+  const blank = ss.getSheetByName('Sheet1');
+  if (blank && ss.getSheets().length > 1 && blank.getLastRow() === 0) ss.deleteSheet(blank);
+}
+
+function sh(name) { return ss_().getSheetByName(name); }
+
+// ===== UTILITIES =====
+
+function hash_(pw, salt) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, salt + pw)
+    .map(b => ('0' + (b & 0xff).toString(16)).slice(-2)).join('');
+}
+
+function fmt_(v) {
+  if (v instanceof Date) return v.toISOString();
+  if (typeof v === 'number') return new Date(v).toISOString();
+  return String(v || '');
+}
+
+function today_() { return Utilities.formatDate(new Date(), TZ, 'yyyy-MM-dd'); }
+
+function readJson_(name) {
+  const v = sh(name).getDataRange().getValues();
+  const j = HDR[name].length - 1;
+  return v.slice(1).map(r => { try { return JSON.parse(r[j]); } catch (e) { return null; } }).filter(Boolean);
+}
+
+function upsert_(name, key, items, toRow) {
+  if (!items || !items.length) return;
+  const s = sh(name), v = s.getDataRange().getValues(), j = HDR[name].length - 1;
+  const idx = {};
+  v.slice(1).forEach((r, k) => { idx[String(r[0])] = {row: k + 2, json: r[j]}; });
+  const add = [];
+  items.forEach(it => {
+    const js = JSON.stringify(it);
+    const hit = idx[String(it[key])];
+    if (hit && hit.json === js) return;
+    const row = toRow(it).concat(js);
+    if (hit) s.getRange(hit.row, 1, 1, row.length).setValues([row]);
+    else add.push(row);
+  });
+  if (add.length) s.getRange(s.getLastRow() + 1, 1, add.length, add[0].length).setValues(add);
+}
+
+function cfg_(key) {
+  const row = sh('Config').getDataRange().getValues().find(r => r[0] === key);
+  try { return row ? JSON.parse(row[1]) : null; } catch (e) { return null; }
+}
+
+function setConfig_(key, val) {
+  const cs = sh('Config'), cv = cs.getDataRange().getValues();
+  const k = cv.findIndex((r, i) => i > 0 && r[0] === key);
+  const json = JSON.stringify(val);
+  if (k > 0) cs.getRange(k + 1, 2).setValue(json);
+  else cs.appendRow([key, json]);
+}
+
+function logLogin_(u, role, result) { sh('Logins').appendRow([new Date(), u, role, result]); }
+
+function logActivity(username, role, action, detail) {
+  sh('Activity').appendRow([new Date(), String(username || '-'), String(role || '-'),
+    String(action || ''), String(detail || '').slice(0, 500)]);
+  return true;
+}
+
+// ===== USERS & AUTH =====
+
+function toUser_(r, row) {
+  return {
+    row: row, username: r[0], role: r[1], name: r[2], phone: r[3], email: r[4], gcash: r[5],
+    seen: Number(r[6]) || 0, created: r[7], organization: r[12] || '', address: r[13] || '',
+    farm: r[14] || '', idType: r[15] || '', idNo: r[16] || '', mustChange: Number(r[17]) || 0
+  };
+}
+
+// What other users may see. Buyer addresses stay private.
+function publicUser_(u) {
+  const hideAddr = BUYER_ROLES.indexOf(u.role) > -1;
+  return {role: u.role, name: u.name, org: u.organization, address: hideAddr ? '' : u.address, farm: u.farm, gcash: u.gcash};
+}
+
+// What a user sees about themselves
+function fullUser_(u) {
+  return Object.assign(publicUser_(u), {username: u.username, phone: u.phone, email: u.email, seen: u.seen,
+    idType: u.idType, address: u.address, mustChange: u.mustChange || 0});
+}
+
+function readUsers_() {
+  return sh('Users').getDataRange().getValues().slice(1)
+    .map((r, i) => toUser_(r, i + 2)).filter(u => u.username);
+}
+
+function getUser_(name) {
+  return name ? (readUsers_().find(u => u.username === name) || null) : null;
+}
+
+function setUserFields_(username, obj) {
+  const u = getUser_(username);
+  if (!u) throw new Error('User not found.');
+  const s = sh('Users');
+  Object.keys(obj).forEach(k => { if (UCOL[k]) s.getRange(u.row, UCOL[k]).setValue(obj[k]); });
+}
+
+// Caller must hold the lock
+function registerUser_(role, u, pw, x) {
+  const s = sh('Users'), v = s.getDataRange().getValues();
+  if (v.some((r, i) => i > 0 && String(r[0]).toLowerCase() === u)) return {ok: false, msg: 'That username is taken. Please log in or choose another.'};
+  if (ALL_ROLES.indexOf(role) < 0) return {ok: false, msg: 'Please choose an account type.'};
+  const name = String(x.name || '').trim(), phone = String(x.phone || '').trim();
+  const org = String(x.org || '').trim(), addr = String(x.addr || '').trim(), email = String(x.email || '').trim();
+  const idType = String(x.idType || ''), idNo = String(x.idNo || '').replace(/\s/g, '');
+  if (!name || phone.length < 7) return {ok: false, msg: 'Registration needs your full name and phone number.'};
+  if (role === 'buyer') {
+    if (!email || !addr) return {ok: false, msg: 'Buyer registration needs your email and address.'};
+    if (ID_TYPES.indexOf(idType) < 0 || idNo.length < 5) return {ok: false, msg: 'Choose your valid ID type and enter the ID number.'};
+  } else if (role !== 'enthusiast' && (!org || !addr)) {
+    return {ok: false, msg: 'Registration needs your ' + (role === 'breeder' ? 'farm / business name' : 'company / buyer name') + ' and address.'};
+  }
+
+  // A breeder's farm is designated at registration: the business name becomes the farm name
+  let farmName = '';
+  if (role === 'breeder') {
+    if (farmExists_(org)) return {ok: false, msg: 'A farm named "' + org + '" already exists. Add a branch name, for example "' + org + ' – Branch 2".'};
+    farmName = org;
+    saveFarmProfile_(farmName, cleanFarmProfile_(farmName, {loc: addr, tel: phone, hours: '8:00 AM - 5:00 PM', p: 150, c: 20, sp: ''}));
+  }
+
+  const isBuyer = role === 'buyer';
+  const salt = Utilities.getUuid();
+  const row = [u, role, name, phone, email, '', 0, new Date(), new Date(), 1,
+    hash_(pw, salt), salt, org, addr, farmName, isBuyer ? idType : '', isBuyer ? idNo : '', 0];
+  s.appendRow(row);
+  logLogin_(u, role, 'REGISTERED');
+  logActivity(u, role, 'Registered', role + ' | ' + (org || name));
+  return {ok: true, user: fullUser_(toUser_(row, v.length + 1))};
+}
+
+function login(role, username, pw, extra) {
+  extra = extra || {};
+  const u = String(username || '').trim().toLowerCase();
+  pw = String(pw || '');
+  if (u.length < 3 || pw.length < 4) return {ok: false, msg: 'Username 3+ and password 4+ characters.'};
+
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    if (extra.mode === 'register') {
+      if (SELF_ROLES.indexOf(role) < 0) return {ok: false, msg: 'Please choose an account type.'};
+      return registerUser_(role, u, pw, extra);
+    }
+    bootstrapAccounts_();   // creates missing admin / farm owner accounts from Script properties
+    const s = sh('Users'), v = s.getDataRange().getValues();
+    const i = v.findIndex((r, k) => k > 0 && String(r[0]).toLowerCase() === u);
+    if (i < 0) { logLogin_(u, '', 'FAILED (no account)'); return {ok: false, msg: 'No account for that username. Please register first.'}; }
+    const r = v[i];
+    if (hash_(pw, r[11]) !== r[10]) { logLogin_(u, r[1], 'FAILED'); return {ok: false, msg: 'Wrong password.'}; }
+    s.getRange(i + 1, 9, 1, 2).setValues([[new Date(), (Number(r[9]) || 0) + 1]]);
+    logLogin_(u, r[1], 'OK');
+    logActivity(u, r[1], 'Login', '');
+    const dashboardToken = r[1] === 'admin' ? issueDashboardToken_(u) : '';
+    return {ok: true, user: fullUser_(toUser_(r, i + 1)), dashboardToken: dashboardToken};
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Creates missing admin / farm owner accounts listed in BOOTSTRAP_ACCOUNTS.
+// Existing accounts are never changed here. These accounts must change their password at first login.
+function bootstrapAccounts_() {
+  const raw = PropertiesService.getScriptProperties().getProperty('BOOTSTRAP_ACCOUNTS');
+  if (!raw) return;
+  let list;
+  try { list = JSON.parse(raw); } catch (e) { throw new Error('BOOTSTRAP_ACCOUNTS is not valid JSON.'); }
+  const s = sh('Users'), v = s.getDataRange().getValues();
+  const have = {};
+  v.slice(1).forEach(r => { have[String(r[0]).toLowerCase()] = true; });
+  list.forEach(a => {
+    const u = String(a.username || '').trim().toLowerCase();
+    if (!u || have[u] || !a.password) return;
+    if (['admin', 'farmowner'].indexOf(a.role) < 0) return;
+    if (a.role === 'farmowner' && !farmExists_(a.farm)) return;
+    const salt = Utilities.getUuid(), now = new Date();
+    const vals = {
+      username: u, role: a.role, name: a.name || u, phone: a.phone || '0000000', email: a.email || '',
+      gcash: '', seen: 0, created: now, lastLogin: '', logins: 0,
+      pwHash: hash_(String(a.password), salt), salt: salt,
+      organization: a.organization || '', address: a.address || '', farm: a.farm || '',
+      idType: '', idNo: '', mustChange: 1
+    };
+    s.appendRow(HDR.Users.map(h => vals[h] !== undefined ? vals[h] : ''));
+    have[u] = true;
+    logActivity('system', 'system', 'Bootstrap account', u + ' (' + a.role + ')');
+  });
+}
+
+// Any logged-in user changes their own password. The current password must be entered.
+function changeMyPassword(actor, oldPw, newPw) {
+  const u = getUser_(actor);
+  if (!u) throw new Error('Please log in first.');
+  oldPw = String(oldPw || '');
+  newPw = String(newPw || '');
+  if (newPw.length < 8) throw new Error('Use at least 8 characters.');
+  if (newPw === oldPw) throw new Error('Choose a password different from the current one.');
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const s = sh('Users');
+    const pair = s.getRange(u.row, 11, 1, 2).getValues()[0];   // [pwHash, salt]
+    if (hash_(oldPw, pair[1]) !== pair[0]) throw new Error('The current password is wrong.');
+    const salt = Utilities.getUuid();
+    s.getRange(u.row, 11, 1, 2).setValues([[hash_(newPw, salt), salt]]);
+    s.getRange(u.row, 18).setValue(0);
+  } finally { lock.releaseLock(); }
+  logActivity(actor, u.role, 'Changed password', '');
+  return {ok: true};
+}
+
+// ===== DASHBOARD TOKENS (admin only, one hour) =====
+
+function issueDashboardToken_(username) {
+  const token = Utilities.getUuid().replace(/-/g, '') + Utilities.getUuid().replace(/-/g, '');
+  CacheService.getScriptCache().put('dashboard:' + token, username, DASH_TOKEN_SECONDS);
+  return token;
+}
+
+// Setup check. Open: <web app URL>?fn=diag&key=YOUR_ADMIN_KEY
+function diagnose_(key) {
+  const want = PropertiesService.getScriptProperties().getProperty('ADMIN_KEY');
+  if (!want || key !== want) return {error: 'Wrong key.'};
+  return {
+    spreadsheet: ss_().getUrl(),
+    usernames: sh('Users').getDataRange().getValues().slice(1).map(r => [r[0], r[1]]).filter(r => r[0]),
+    bootstrapSet: !!PropertiesService.getScriptProperties().getProperty('BOOTSTRAP_ACCOUNTS')
+  };
+}
+
+function requireAdmin_(actor) {
+  const u = getUser_(actor);
+  if (!u || u.role !== 'admin') throw new Error('Administrator access only.');
+  return u;
+}
+
+function updateOwnProfile(actor, d) {
+  const u = getUser_(actor);
+  if (!u) throw new Error('Please log in first.');
+  d = d || {};
+  const name = String(d.name || '').trim(), phone = String(d.phone || '').trim();
+  if (!name || phone.length < 7) throw new Error('Name and a valid phone number are required.');
+  const f = {name: name, phone: phone, email: String(d.email || '').trim(),
+    organization: String(d.organization || '').trim(), address: String(d.address || '').trim()};
+  if (['breeder', 'farmowner', 'admin'].indexOf(u.role) > -1) f.gcash = String(d.gcash || '').replace(/\s/g, '');
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try { setUserFields_(actor, f); } finally { lock.releaseLock(); }
+  return {ok: true};
+}
+
+function markSeen(actor, ts) {
+  if (!getUser_(actor)) return false;
+  setUserFields_(actor, {seen: Number(ts) || Date.now()});
+  return true;
+}
+
+// ===== ADMIN: USER MANAGEMENT =====
+
+function adminListUsers(actor) {
+  requireAdmin_(actor);
+  return readUsers_().map(u => ({
+    username: u.username, role: u.role, name: u.name, phone: u.phone, email: u.email,
+    gcash: u.gcash, organization: u.organization, address: u.address, farm: u.farm,
+    idType: u.idType, created: fmt_(u.created)
+  }));
+}
+
+function adminCreateFarmOwner(actor, d) {
+  requireAdmin_(actor);
+  d = d || {};
+  const u = String(d.username || '').trim().toLowerCase(), pw = String(d.password || '');
+  if (u.length < 3 || pw.length < 4) throw new Error('Username 3+ and password 4+ characters.');
+  if (!farmExists_(d.farm)) throw new Error('Choose the farm this owner manages.');
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const res = registerUser_('farmowner', u, pw, {name: d.name, phone: d.phone, email: d.email, org: d.organization, addr: d.address});
+    if (!res.ok) throw new Error(res.msg);
+    setUserFields_(u, {farm: d.farm, mustChange: 1});
+  } finally { lock.releaseLock(); }
+  logActivity(actor, 'admin', 'Created farm owner', u + ' → ' + d.farm);
+  return {ok: true};
+}
+
+function adminUpdateUser(actor, d) {
+  requireAdmin_(actor);
+  d = d || {};
+  const target = getUser_(String(d.username || ''));
+  if (!target) throw new Error('User not found.');
+  const f = {};
+  ['name', 'phone', 'email', 'gcash', 'organization', 'address'].forEach(k => {
+    if (d[k] !== undefined) f[k] = String(d[k]).trim();
+  });
+  if (d.role !== undefined) {
+    if (ALL_ROLES.indexOf(d.role) < 0) throw new Error('Invalid role.');
+    f.role = d.role;
+  }
+  if (d.farm !== undefined) {
+    if (d.farm && !farmExists_(d.farm)) throw new Error('Invalid farm.');
+    f.farm = d.farm || '';
+  }
+  if (d.password) {
+    if (String(d.password).length < 4) throw new Error('Password must be 4+ characters.');
+    const salt = Utilities.getUuid();
+    f.salt = salt;
+    f.pwHash = hash_(String(d.password), salt);
+    f.mustChange = 1;   // the user must set their own password at next login
+  }
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try { setUserFields_(target.username, f); } finally { lock.releaseLock(); }
+  logActivity(actor, 'admin', 'Edited user', target.username);
+  return {ok: true};
+}
+
+// ===== FARM PROFILES (built-in farms + farms created by breeders/admin) =====
+
+function farmProfiles_() { return cfg_('farmProfiles') || {}; }
+function farmExists_(name) { return !!name && (!!FARM_DEFAULTS[name] || !!farmProfiles_()[name]); }
+
+function cleanFarmProfile_(name, d) {
+  d = d || {};
+  const num = (v, min, max, dflt) => { const n = parseFloat(v); return isFinite(n) ? Math.min(max, Math.max(min, n)) : dflt; };
+  const lat = parseFloat(d.lat), lng = parseFloat(d.lng);
+  const sp = Array.isArray(d.sp) ? d.sp : String(d.sp || '').split(',');
+  return {
+    name: name,
+    loc: String(d.loc || '').trim().slice(0, 120),
+    tel: String(d.tel || '').trim().slice(0, 40),
+    hours: String(d.hours || '').trim().slice(0, 60),
+    p: num(d.p, 0, 100000, 150),
+    c: Math.round(num(d.c, 1, 500, 20)),
+    lat: isFinite(lat) ? lat : null,
+    lng: isFinite(lng) ? lng : null,
+    sp: sp.map(s => String(s).trim()).filter(Boolean).slice(0, 12)
+  };
+}
+
+function saveFarmProfile_(name, prof) {
+  const all = farmProfiles_();
+  all[name] = prof;
+  setConfig_('farmProfiles', all);
+}
+
+// A breeder edits ONLY the farm designated to their account
+function updateMyFarm(actor, d) {
+  const u = getUser_(actor);
+  if (!u || u.role !== 'breeder') throw new Error('Only breeders can edit their farm profile here.');
+  if (!u.farm) throw new Error('No farm is assigned to your account yet. Ask the administrator.');
+  return saveFarmFor_(actor, u.farm, d, false);
+}
+
+// Admin edits or creates any farm profile
+function adminSaveFarm(actor, name, d) {
+  requireAdmin_(actor);
+  name = String(name || '').trim();
+  if (!name) throw new Error('Enter the farm name.');
+  return saveFarmFor_(actor, name, d, true);
+}
+
+function saveFarmFor_(actor, name, d, asAdmin) {
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  let prof;
+  try {
+    const existing = farmProfiles_()[name] || {};
+    prof = cleanFarmProfile_(name, Object.assign({}, existing, d || {}));
+    saveFarmProfile_(name, prof);
+  } finally { lock.releaseLock(); }
+  logActivity(actor, asAdmin ? 'admin' : 'breeder', 'Farm profile saved', name);
+  return {ok: true, farm: prof};
+}
+
+// ===== PER-BREEDER CATALOG =====
+
+function catKey_(b) { return 'catalog|' + b; }
+
+function getCatalogs_() {
+  const out = {};
+  sh('Config').getDataRange().getValues().slice(1).forEach(r => {
+    const k = String(r[0]);
+    if (k.indexOf('catalog|') !== 0) return;
+    try { out[k.slice(8)] = JSON.parse(r[1]); } catch (e) {}
+  });
+  return out;
+}
+
+function toLotRow_(l) {
+  return [l.id, l.breeder, l.sp, l.qty, l.left, l.price, new Date(l.created), new Date(l.exp), l.notes || ''];
+}
+
+// Breeder sets their own price and/or flood flag for one species
+function setCatalogItem(actor, sp, patch) {
+  const u = getUser_(actor);
+  if (!u || u.role !== 'breeder') throw new Error('Only breeders can set catalog prices.');
+  sp = String(sp || '');
+  if (sp.indexOf('Butterfly-') !== 0) throw new Error('Unknown species.');
+  patch = patch || {};
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  let item;
+  try {
+    const cat = getCatalogs_()[actor] || {};
+    item = Object.assign({price: 50, flooded: false}, cat[sp] || {});
+    if (patch.price !== undefined) {
+      const p = parseFloat(patch.price);
+      if (!(p >= 0)) throw new Error('Enter a valid price.');
+      item.price = p;
+      // Live listings of this species follow the new price until the next notice
+      const live = readJson_('Lots').filter(l => l.breeder === actor && l.sp === sp && l.left > 0);
+      live.forEach(l => { l.price = p; });
+      upsert_('Lots', 'id', live, toLotRow_);
+    }
+    if (patch.flooded !== undefined) item.flooded = !!patch.flooded;
+    cat[sp] = item;
+    setConfig_(catKey_(actor), cat);
+  } finally { lock.releaseLock(); }
+  logActivity(actor, 'breeder', 'Catalog update', sp + ' ' + JSON.stringify(patch));
+  return {ok: true, item: item};
+}
+
+// Post fresh pupae. The price comes from the breeder's catalog, never from the client.
+function postFreshPupae(actor, d) {
+  const u = getUser_(actor);
+  if (!u || u.role !== 'breeder') throw new Error('Only breeders can post fresh pupae.');
+  d = d || {};
+  const sp = String(d.sp || ''), qty = parseInt(d.qty, 10);
+  if (sp.indexOf('Butterfly-') !== 0) throw new Error('Choose a species.');
+  if (!(qty >= 1)) throw new Error('Enter the exact number of pupae.');
+  if (!d.qaPassed) throw new Error('Complete every quality assurance check first.');
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  let lot;
+  try {
+    const item = (getCatalogs_()[actor] || {})[sp] || {price: 50, flooded: false};
+    if (item.flooded) throw new Error('This species is flooded. Turn off the flood flag in Manage prices first.');
+    const now = Date.now();
+    lot = {id: 'L' + now.toString(36), breeder: actor, sp: sp, qty: qty, left: qty, price: item.price,
+      notes: String(d.notes || '').slice(0, 300), created: now, exp: now + 2 * 864e5};
+    upsert_('Lots', 'id', [lot], toLotRow_);
+  } finally { lock.releaseLock(); }
+  logActivity(actor, 'breeder', 'Post fresh pupae', sp + ' x' + qty + ' @' + lot.price);
+  return lot;
+}
+
+// Breeder sets the exact number of pupae still available (0 = withdraw)
+function setLotLeft(actor, id, n) {
+  const u = getUser_(actor);
+  if (!u || u.role !== 'breeder') throw new Error('Only breeders can change listing counts.');
+  n = parseInt(n, 10);
+  if (!(n >= 0)) throw new Error('Enter a valid number.');
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  let l;
+  try {
+    l = readJson_('Lots').find(x => x.id === String(id));
+    if (!l || l.breeder !== actor) throw new Error('Listing not found.');
+    l.qty = l.qty - l.left + n;
+    l.left = n;
+    upsert_('Lots', 'id', [l], toLotRow_);
+  } finally { lock.releaseLock(); }
+  logActivity(actor, 'breeder', 'Set pupae count', l.id + ' now ' + n);
+  return {ok: true};
+}
+
+// ===== SALES RECORD =====
+// Completed (Received) orders only. Admin sees all, a breeder sees their own sales,
+// a buyer sees their own purchases. Everyone else gets an empty list.
+function salesRecordFor_(u) {
+  if (!u) return [];
+  const isAdm = u.role === 'admin';
+  const isSeller = u.role === 'breeder';
+  const isBuyer = BUYER_ROLES.indexOf(u.role) > -1;
+  if (!isAdm && !isSeller && !isBuyer) return [];
+  return readJson_('Orders')
+    .filter(o => o.status === 'Received')
+    .filter(o => isAdm || (isSeller && o.breeder === u.username) || (isBuyer && o.buyer === u.username))
+    .map(o => ({
+      id: o.id, date: o.receivedAt || o.created, sp: o.sp, qty: o.qty, price: o.price, total: o.total,
+      breeder: o.breeder, sellerName: o.sellerName || o.breeder,
+      buyer: o.buyer, buyerName: o.buyerName || o.buyer
+    }))
+    .sort((a, b) => (b.date || 0) - (a.date || 0));
+}
+
+// ===== STATE (polling) =====
+
+function parkCfg_() { return cfg_('park') || {}; }
+
+// Seats and price: farm profile first, then park override, then built-in default
+function farmCap_(f, park) {
+  const pr = farmProfiles_()[f];
+  if (pr && pr.c != null) return pr.c;
+  const o = (park.farms && park.farms[f]) || {};
+  if (o.c != null) return o.c;
+  return (FARM_DEFAULTS[f] || {c: 20}).c;
+}
+function farmPrice_(f, park) {
+  const pr = farmProfiles_()[f];
+  if (pr && pr.p != null) return pr.p;
+  const o = (park.farms && park.farms[f]) || {};
+  if (o.p != null) return o.p;
+  return (FARM_DEFAULTS[f] || {p: 150}).p;
+}
+
+function readRes_() { return readJson_('Reservations'); }
+
+function upsertRes_(r) {
+  upsert_('Reservations', 'ref', [r], x => [x.ref, x.user, x.farm, x.name, x.phone, x.date, x.slot, x.n, x.total, x.status, x.payRef || '']);
+}
+
+function booked_(f, date, slot, exclude) {
+  return readRes_()
+    .filter(r => LIVE.indexOf(r.status) > -1 && r.farm === f && r.date === date && r.slot === slot && r.ref !== exclude)
+    .reduce((a, r) => a + (r.n || 0), 0);
+}
+
+function canManage_(u, r) { return !!u && (u.role === 'admin' || (u.role === 'farmowner' && u.farm === r.farm)); }
+function canSee_(u, r) { return !!u && (u.username === r.user || canManage_(u, r)); }
+
+// Hide contact details from people who are not part of the booking
+function redact_(r) {
+  const x = Object.assign({}, r);
+  delete x.phone; delete x.email; delete x.payRef; delete x.notes;
+  return x;
+}
+
+// ===== SEAT CAPACITY (per farm, per date range) =====
+
+function capRules_() { return cfg_('capRules') || {}; }
+
+// Seats per slot for a farm on a date. A rule with cap 0 closes that farm on those dates.
+function capacityFor_(f, date, park, rules) {
+  let cap = farmCap_(f, park);
+  ((rules || {})[f] || []).forEach(r => { if (date >= r.from && date <= r.to) cap = r.cap; });
+  return cap;
+}
+
+// Seats already booked, keyed "farm|date|slot". Counts only, no guest details.
+function bookedMap_() {
+  const m = {};
+  readRes_().forEach(r => {
+    if (LIVE.indexOf(r.status) < 0) return;
+    const k = r.farm + '|' + r.date + '|' + r.slot;
+    m[k] = (m[k] || 0) + (r.n || 0);
+  });
+  return m;
+}
+
+function getState(actor) {
+  const me = getUser_(actor);
+  const users = {};
+  readUsers_().forEach(u => { users[u.username] = u.username === actor ? fullUser_(u) : publicUser_(u); });
+  const cfg = {};
+  sh('Config').getDataRange().getValues().slice(1).forEach(r => {
+    try { cfg[r[0]] = JSON.parse(r[1]); } catch (e) {}
+  });
+  const seeOrder = o => !!me && (me.role === 'admin' || o.buyer === actor || o.breeder === actor);
+  return {
+    users: users,
+    catalog: getCatalogs_(),
+    salesRecord: salesRecordFor_(me),
+    park: cfg.park || {},
+    capRules: cfg.capRules || {},
+    farms: farmProfiles_(),
+    booked: bookedMap_(),
+    lots: readJson_('Lots'),
+    orders: readJson_('Orders').filter(seeOrder),
+    // Visitors see their own bookings, farm owners see their farm, admins see all
+    reservations: readRes_().filter(r => canSee_(me, r))
+  };
+}
+
+// Only park settings are saved from the client. Farm owners use setFarmCapacity instead.
+function saveState(actor, st) {
+  const u = getUser_(actor);
+  if (!u) throw new Error('Please log in first.');
+  if (['breeder', 'admin'].indexOf(u.role) > -1 && st && st.park) {
+    const lock = LockService.getScriptLock(); lock.waitLock(20000);
+    try { setConfig_('park', st.park); } finally { lock.releaseLock(); }
+  }
+  return true;
+}
+
+function datesBetween_(from, to) {
+  const out = [], d = new Date(from + 'T00:00:00Z'), end = new Date(to + 'T00:00:00Z');
+  for (; d <= end && out.length < 400; d.setUTCDate(d.getUTCDate() + 1)) out.push(d.toISOString().slice(0, 10));
+  return out;
+}
+
+// Farm owner sets seats per slot for date ranges on THEIR farm (admin can choose any farm).
+// rules: [{from:'YYYY-MM-DD', to:'YYYY-MM-DD', cap:0..500, label}]. cap 0 closes the farm on those dates.
+function setFarmCapacity(actor, farmName, rules) {
+  const u = getUser_(actor);
+  if (!u || (u.role !== 'farmowner' && u.role !== 'admin')) throw new Error('Only farm owners can set seat capacity.');
+  const farm = u.role === 'admin' ? String(farmName || '') : u.farm;
+  if (!farmExists_(farm)) throw new Error('No farm is assigned to this account.');
+  if (!Array.isArray(rules)) throw new Error('Invalid capacity rules.');
+  const today = today_();
+  const clean = rules.map(r => {
+    const from = String(r.from || ''), to = String(r.to || '');
+    const cap = parseInt(r.cap, 10);
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) throw new Error('Use valid dates.');
+    if (from > to) throw new Error('The "From" date must be on or before the "To" date.');
+    if (to < today) throw new Error('Rules must end today or later.');
+    if (!(cap >= 0 && cap <= 500)) throw new Error('Seats per slot must be 0 to 500 (0 closes the farm).');
+    return {from: from, to: to, cap: cap, label: String(r.label || '').slice(0, 60)};
+  }).sort((a, b) => a.from < b.from ? -1 : 1);
+  for (let i = 1; i < clean.length; i++) {
+    if (clean[i].from <= clean[i - 1].to) throw new Error('Date ranges overlap. Split them so each date has one rule.');
+  }
+
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  const warnings = [];
+  try {
+    const all = cfg_('capRules') || {};
+    all[farm] = clean;
+    setConfig_('capRules', all);
+    const booked = bookedMap_();
+    clean.forEach(r => datesBetween_(r.from, r.to).forEach(date => SLOTS.forEach(s => {
+      const used = booked[farm + '|' + date + '|' + s] || 0;
+      if (used > r.cap) warnings.push(date + ' ' + s.split(' - ')[0] + ': ' + used + ' booked, limit ' + r.cap);
+    })));
+  } finally { lock.releaseLock(); }
+
+  logActivity(actor, u.role, 'Set seat capacity', farm + ' · ' + clean.length + ' rule(s)');
+  return {ok: true, rules: clean, warnings: warnings.slice(0, 10)};
+}
+
+// ===== BUYER ORDERS =====
+
+function toOrderRow_(o) {
+  return [o.id, o.buyer, o.breeder, o.sp, o.qty, o.total, o.status, o.payRef || '', new Date(o.created)];
+}
+
+function emailOf_(username) {
+  const u = getUser_(username);
+  return u ? u.email : '';
+}
+
+// items: [{breeder, sp, qty, lotId?}]. Stock comes from live, unflooded listings, oldest first.
+function placeOrder(actor, items) {
+  const u = getUser_(actor);
+  if (!u || BUYER_ROLES.indexOf(u.role) < 0) throw new Error('Only buyers can place orders.');
+  if (!u.phone || !u.address) throw new Error('Add your phone number and address in More → Edit profile first.');
+  if (u.role === 'buyer' && !u.idNo) throw new Error('Your buyer account has no valid ID on file. Please contact the administrator.');
+  if (!Array.isArray(items) || !items.length) throw new Error('Your cart is empty.');
+
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  const orders = [];
+  const lotsChanged = [];
+  try {
+    const cats = getCatalogs_(), now = Date.now();
+    const lots = readJson_('Lots').filter(l => l.left > 0 && now < l.exp &&
+      !((cats[l.breeder] || {})[l.sp] || {}).flooded);
+    items.forEach(it => {
+      const sp = String(it.sp || ''), b = String(it.breeder || '');
+      let need = parseInt(it.qty, 10);
+      if (!(need >= 1)) throw new Error('Enter a valid quantity.');
+      if (((cats[b] || {})[sp] || {}).flooded) throw new Error(sp.replace('Butterfly-', '') + ' is flooded and cannot be bought right now.');
+      const pool = lots.filter(l => l.breeder === b && l.sp === sp && (!it.lotId || l.id === it.lotId))
+        .sort((x, y) => x.created - y.created);
+      const avail = pool.reduce((a, l) => a + l.left, 0);
+      if (need > avail) throw new Error('Only ' + avail + ' pupae left for ' + sp.replace('Butterfly-', '') + '.');
+      pool.forEach(l => {
+        if (need <= 0) return;
+        const take = Math.min(need, l.left);
+        need -= take; l.left -= take;
+        if (lotsChanged.indexOf(l) < 0) lotsChanged.push(l);
+        orders.push({
+          id: 'OR' + Utilities.getUuid().replace(/-/g, '').slice(0, 8).toUpperCase(),
+          lot: l.id, buyer: actor, buyerName: u.name, buyerPhone: u.phone, buyerEmail: u.email,
+          buyerAddress: u.address, buyerIdType: u.idType || '', breeder: b, sellerName: '', sellerPhone: '',
+          sp: sp, qty: take, price: l.price, total: take * l.price,
+          status: 'Awaiting Payment', payRef: '', created: now
+        });
+      });
+    });
+    orders.forEach(o => {
+      const s = getUser_(o.breeder) || {};
+      o.sellerName = s.name || o.breeder; o.sellerPhone = s.phone || '';
+    });
+    upsert_('Lots', 'id', lotsChanged, toLotRow_);
+    upsert_('Orders', 'id', orders, toOrderRow_);
+  } finally { lock.releaseLock(); }
+
+  orders.forEach(o => {
+    const what = o.qty + ' × ' + o.sp.replace('Butterfly-', '') + ' at ₱' + Number(o.price).toFixed(2) + ' each (₱' + Number(o.total).toFixed(2) + ')';
+    mail_(emailOf_(o.breeder), 'New pupae order ' + o.id,
+      o.buyerName + ' ordered ' + what + '.\n\nBuyer contact: ' + o.buyerPhone + ' · ' + o.buyerEmail +
+      '\nAddress: ' + o.buyerAddress + '\n\nThe buyer will pay via GCash. Confirm the payment in the app under Pupae → Orders.');
+    mail_(o.buyerEmail, 'Order ' + o.id + ' placed',
+      'Thank you. You ordered ' + what + ' from ' + o.sellerName + '.\nSeller contact: ' + o.sellerPhone +
+      '\n\nPay via GCash and submit the reference number in the app to complete the order.');
+    logActivity(actor, u.role, 'Order placed', o.id + ' ' + o.sp + ' x' + o.qty + ' from ' + o.breeder);
+  });
+  return orders;
+}
+
+// Actions: submitPay (buyer) · cancel (buyer or seller) · received (seller or admin)
+function updateOrder(actor, id, action, d) {
+  const u = getUser_(actor);
+  if (!u) throw new Error('Please log in first.');
+  d = d || {};
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  let o, msg = '';
+  try {
+    const all = readJson_('Orders');
+    o = all.find(x => x.id === String(id));
+    if (!o) throw new Error('Order not found.');
+    const isBuyer = o.buyer === actor, isSeller = o.breeder === actor || u.role === 'admin';
+    const notAllowed = () => new Error('This action is not allowed for the current status.');
+
+    if (action === 'submitPay') {
+      if (!isBuyer || o.status !== 'Awaiting Payment') throw notAllowed();
+      const v = String(d.payRef || '').replace(/\s/g, '');
+      if (!/^\d{10,13}$/.test(v)) throw new Error('Enter the 10–13 digit GCash reference number.');
+      if (all.some(x => x.id !== o.id && x.payRef === v)) throw new Error('That reference number was already used.');
+      o.payRef = v; o.status = 'Paid – Awaiting Receipt';
+      msg = o.buyerName + ' paid order ' + o.id + ' (GCash ref ' + v + '). Please confirm receipt.';
+    } else if (action === 'cancel') {
+      if (!(isBuyer || isSeller) || o.status !== 'Awaiting Payment') throw notAllowed();
+      o.status = 'Cancelled';
+      const l = readJson_('Lots').find(x => x.id === o.lot);
+      if (l) { l.left += o.qty; upsert_('Lots', 'id', [l], toLotRow_); }
+      msg = 'Order ' + o.id + ' was cancelled. ' + o.qty + ' pupae returned to stock.';
+    } else if (action === 'received') {
+      if (!isSeller || o.status !== 'Paid – Awaiting Receipt') throw notAllowed();
+      o.status = 'Received';
+      o.receivedAt = Date.now();
+      msg = 'Payment for order ' + o.id + ' was received. Thank you!';
+    } else {
+      throw new Error('Unknown action.');
+    }
+    upsert_('Orders', 'id', [o], toOrderRow_);
+  } finally { lock.releaseLock(); }
+
+  mail_(emailOf_(o.breeder), 'Order ' + o.id + ' – ' + o.status, msg);
+  mail_(o.buyerEmail, 'Order ' + o.id + ' – ' + o.status, msg);
+  logActivity(actor, u.role, 'Order ' + action, o.id + ' → ' + o.status);
+  return {status: o.status};
+}
+
+// ===== FARM VISITS: availability, approval, payment =====
+
+function ownersOf_(f) { return readUsers_().filter(u => u.role === 'farmowner' && u.farm === f && u.email).map(u => u.email); }
+
+function gcashOf_(f, park) {
+  if (park.gNo) return park.gNo;
+  const o = readUsers_().find(u => u.role === 'farmowner' && u.farm === f && u.gcash);
+  return (o && o.gcash) || 'the farm (ask via messages)';
+}
+
+function addMsg_(ref, from, text) {
+  sh('Messages').appendRow([new Date(), ref, from, String(text).slice(0, 800)]);
+}
+
+function mail_(to, subject, body) {
+  if (!to || (Array.isArray(to) && !to.length)) return;
+  try { MailApp.sendEmail(Array.isArray(to) ? to.join(',') : to, subject, body); }
+  catch (e) { Logger.log('Mail failed: ' + e); }
+}
+
+// AI writes friendly wording only when a Gemini key is set; facts always come from the rules
+function draftText_(facts, fallback) {
+  const props = PropertiesService.getScriptProperties();
+  const key = props.getProperty('GEMINI_API_KEY');
+  if (!key) return fallback;
+  try {
+    const model = props.getProperty('GEMINI_MODEL') || 'gemini-2.0-flash';
+    const prompt = 'Write one short, friendly, professional message (max 2 sentences, no emojis) for a butterfly farm visitor. ' +
+      'Use only these facts and do not invent anything: ' + facts;
+    const res = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent?key=' + key, {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify({contents: [{parts: [{text: prompt}]}]}), muteHttpExceptions: true
+    });
+    if (res.getResponseCode() !== 200) return fallback;
+    const text = JSON.parse(res.getContentText()).candidates[0].content.parts[0].text.trim();
+    return text || fallback;
+  } catch (e) { return fallback; }
+}
+
+// Visitor submits a request. The seat count decides Awaiting Approval or Full automatically.
+function requestReservation(actor, d) {
+  const u = getUser_(actor);
+  if (!u) throw new Error('Please log in first.');
+  d = d || {};
+  const f = String(d.farm || ''), date = String(d.date || ''), slot = String(d.slot || '');
+  const n = parseInt(d.n, 10);
+  const name = String(d.name || '').trim(), phone = String(d.phone || '').replace(/\s/g, '');
+  if (!farmExists_(f)) throw new Error('Please choose a farm.');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || date <= today_()) throw new Error('Choose a date from tomorrow onward.');
+  if (SLOTS.indexOf(slot) < 0) throw new Error('Please select a time slot.');
+  if (!(n >= 1)) throw new Error('Enter the number of visitors.');
+  if (!name || phone.length < 7) throw new Error('Enter your name and a valid phone number.');
+  if (d.terms !== true) throw new Error('Please agree to the terms.');
+
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  let res, remaining;
+  try {
+    const park = parkCfg_();
+    if ((park.closed || []).indexOf(date) > -1) throw new Error('This farm is closed on that date.');
+    const cap = capacityFor_(f, date, park, capRules_());
+    if (cap <= 0) throw new Error('This farm is closed on that date.');
+    if (n > cap) throw new Error('Visitors must be 1 to ' + cap + ' for this time slot.');
+    remaining = cap - booked_(f, date, slot, '');
+    res = {
+      ref: 'BK' + Date.now().toString(36).toUpperCase().slice(-6), user: actor, farm: f, name: name, phone: phone,
+      email: String(d.email || u.email || '').trim(), purpose: String(d.purpose || ''), date: date, slot: slot, n: n,
+      notes: String(d.notes || '').slice(0, 300), total: n * farmPrice_(f, park),
+      status: n <= remaining ? 'Awaiting Approval' : 'Full', payRef: '', note: '', created: Date.now()
+    };
+    upsertRes_(res);
+  } finally { lock.releaseLock(); }
+
+  const left = Math.max(remaining, 0);
+  const facts = n + ' visitor(s) at ' + f + ', ' + date + ', ' + slot;
+  const message = res.status === 'Full'
+    ? draftText_('The slot is FULL with only ' + left + ' seat(s) left. Apologize and ask them to pick another time. ' + facts + '.',
+        'Sorry, ' + slot + ' on ' + date + ' is full at ' + f + ' (' + left + ' seat(s) left). Please choose another time.')
+    : draftText_('Seats are AVAILABLE. Tell them the request was sent to the farm owner for approval. ' + facts + '.',
+        'Good news! ' + n + ' seat(s) are available for ' + slot + ' on ' + date + ' at ' + f + '. Your request has been sent to the farm owner for approval.');
+
+  addMsg_(res.ref, 'System', message);
+  if (res.status === 'Awaiting Approval') {
+    mail_(ownersOf_(f), 'New visit request ' + res.ref,
+      name + ' requested ' + n + ' visitor(s) at ' + f + ' on ' + date + ', ' + slot + '.\nApprove it in the app: Orders tab.');
+  }
+  mail_(res.email, 'Booking ' + res.ref + ' – ' + res.status, message);
+  logActivity(actor, u.role, 'Park request', res.ref + ' | ' + res.status);
+  return {ref: res.ref, status: res.status, message: message};
+}
+
+// Actions: approve, reject, confirm (farm owner of that farm, or admin) · submitPay, cancel (visitor)
+function updateReservation(actor, ref, action, d) {
+  const u = getUser_(actor);
+  if (!u) throw new Error('Please log in first.');
+  d = d || {};
+  let r, msg = '';
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const all = readRes_();
+    r = all.find(x => x.ref === ref);
+    if (!r) throw new Error('Reservation not found.');
+    const mine = r.user === actor, mgr = canManage_(u, r);
+    const park = parkCfg_();
+    const notAllowed = () => new Error('This action is not allowed for the current status.');
+
+    if (action === 'submitPay') {
+      if (!mine || r.status !== 'Pending Payment') throw notAllowed();
+      const v = String(d.payRef || '').replace(/\s/g, '');
+      if (!/^\d{10,13}$/.test(v)) throw new Error('Enter the 10–13 digit GCash reference number.');
+      if (all.some(x => x.ref !== ref && x.payRef === v)) throw new Error('That reference number was already used.');
+      r.payRef = v; r.status = 'Payment Submitted';
+      msg = r.name + ' submitted GCash reference ' + v + ' for booking ' + r.ref + '. Please verify and confirm.';
+    } else if (action === 'approve') {
+      if (!mgr || r.status !== 'Awaiting Approval') throw notAllowed();
+      const rem = capacityFor_(r.farm, r.date, park, capRules_()) - booked_(r.farm, r.date, r.slot, r.ref);
+      if (r.n <= rem) {
+        r.status = 'Pending Payment';
+        msg = 'Your booking ' + r.ref + ' for ' + r.date + ', ' + r.slot + ' is approved. Please pay ₱' +
+          Number(r.total).toFixed(2) + ' via GCash to ' + gcashOf_(r.farm, park) + ' and submit the reference number in the Visits tab.';
+      } else {
+        r.status = 'Full';
+        msg = 'Sorry, ' + r.slot + ' on ' + r.date + ' filled up before approval. Please choose another time.';
+      }
+    } else if (action === 'reject') {
+      if (!mgr || ['Awaiting Approval', 'Pending Payment', 'Payment Submitted'].indexOf(r.status) < 0) throw notAllowed();
+      r.status = 'Rejected';
+      r.note = String(d.note || '').slice(0, 300);
+      msg = 'Your booking ' + r.ref + ' was not approved.' + (r.note ? ' Reason: ' + r.note : '');
+    } else if (action === 'confirm') {
+      if (!mgr || r.status !== 'Payment Submitted') throw notAllowed();
+      r.status = 'Confirmed';
+      msg = 'Payment received. Booking ' + r.ref + ' is confirmed for ' + r.date + ', ' + r.slot + '. See you there!';
+    } else if (action === 'cancel') {
+      if (!(mine || mgr) || ['Rejected', 'Cancelled', 'Confirmed', 'Full'].indexOf(r.status) > -1) throw notAllowed();
+      r.status = 'Cancelled';
+      msg = 'Booking ' + r.ref + ' was cancelled.';
+    } else {
+      throw new Error('Unknown action.');
+    }
+    r.decidedBy = u.name || actor;
+    r.decidedAt = Date.now();
+    upsertRes_(r);
+  } finally { lock.releaseLock(); }
+
+  const text = draftText_('Booking status update to tell the visitor kindly: ' + msg, msg);
+  addMsg_(r.ref, 'System', text);
+  if (action === 'submitPay') mail_(ownersOf_(r.farm), 'Payment submitted – ' + r.ref, msg);
+  else mail_(r.email, 'Booking ' + r.ref + ' – ' + r.status, text);
+  logActivity(actor, u.role, 'Reservation ' + action, r.ref + ' → ' + r.status);
+  return {status: r.status, message: text};
+}
+
+function getMessages(actor, ref) {
+  const u = getUser_(actor), r = readRes_().find(x => x.ref === ref);
+  if (!r || !canSee_(u, r)) throw new Error('Not allowed.');
+  return sh('Messages').getDataRange().getValues().slice(1)
+    .filter(m => m[1] === ref)
+    .map(m => ({time: fmt_(m[0]), from: String(m[2]), text: String(m[3])}));
+}
+
+function sendMessage(actor, ref, text) {
+  const u = getUser_(actor), r = readRes_().find(x => x.ref === ref);
+  if (!r || !canSee_(u, r)) throw new Error('Not allowed.');
+  const t = String(text || '').trim();
+  if (!t) throw new Error('Message is empty.');
+  const visitor = r.user === actor;
+  const from = visitor ? (u.name || actor) : ((u.role === 'admin' ? 'Admin' : (u.name || 'Farm owner')) + ' · ' + r.farm);
+  addMsg_(ref, from, t);
+  mail_(visitor ? ownersOf_(r.farm) : r.email, 'Booking ' + ref + ' – new message', from + ' wrote:\n\n' + t);
+  return true;
+}
+
+// ===== AI CLASSIFICATION: model server connection =====
+
+function cnnConfig_() {
+  const p = PropertiesService.getScriptProperties();
+  const url = (p.getProperty('CNN_API_URL') || '').trim().replace(/\/+$/, '');
+  const token = (p.getProperty('CNN_API_TOKEN') || '').trim();
+  if (!url || !token) throw new Error('CNN API is not configured. Add CNN_API_URL and CNN_API_TOKEN in Script properties.');
+  if (!/^https:\/\/[a-z0-9.-]+\.[a-z]{2,}(:\d+)?$/i.test(url) || /your-|example|placeholder/i.test(url)) {
+    throw new Error('CNN_API_URL is not a real address (' + url + '). Set it to your model server address, for example https://lepvision-api.onrender.com');
+  }
+  return {url: url, token: token};
+}
+
+// Calls the model server and turns network failures into a readable message
+function cnnFetch_(path, opts) {
+  const cfg = cnnConfig_();
+  opts = opts || {};
+  opts.headers = Object.assign({Authorization: 'Bearer ' + cfg.token}, opts.headers || {});
+  opts.muteHttpExceptions = true;
+  try {
+    return UrlFetchApp.fetch(cfg.url + path, opts);
+  } catch (e) {
+    throw new Error('Cannot reach the model server at ' + cfg.url + ' (' + String(e.message || e).slice(0, 120) +
+      '). Check CNN_API_URL, and that the model service is deployed and running.');
+  }
+}
+
+function cnnStatus() {
+  const res = cnnFetch_('/api/cnn/status', {method: 'get'});
+  if (res.getResponseCode() !== 200) throw new Error('Model server responded with HTTP ' + res.getResponseCode());
+  return JSON.parse(res.getContentText());
+}
+
+// Older single-image endpoint (kept for compatibility)
+function classifyImage(actor, imageBase64, mime, analysisType) {
+  if (!getUser_(actor)) throw new Error('Please log in first.');
+  if (!imageBase64) throw new Error('No image received.');
+  if (imageBase64.length > 14 * 1024 * 1024) throw new Error('Image is too large. Please use a smaller photo.');
+  const res = cnnFetch_('/api/classify-json', {
+    method: 'post', contentType: 'application/json',
+    payload: JSON.stringify({analysis_type: analysisType, image_base64: imageBase64, mime: mime || 'image/jpeg'})
+  });
+  if (res.getResponseCode() !== 200) throw new Error('Model server error ' + res.getResponseCode() + ': ' + res.getContentText().slice(0, 200));
+  return JSON.parse(res.getContentText());
+}
+
+// ===== MEDIA (photos stored in Google Drive) =====
+
+function getMedia() {
+  const o = {};
+  sh('Media').getDataRange().getValues().slice(1).forEach(r => { if (r[0]) o[r[0]] = r[1]; });
+  return o;
+}
+
+const DATASET_PATH = ['Butterfly Dataset', 'images'];
+
+function getDatasetFolder_() {
+  let folder = DriveApp.getRootFolder();
+  DATASET_PATH.forEach(name => {
+    const it = folder.getFoldersByName(name);
+    folder = it.hasNext() ? it.next() : folder.createFolder(name);
+  });
+  return folder;
+}
+
+function saveMedia(actor, key, dataUrl) {
+  const u = getUser_(actor);
+  if (!u || (u.role !== 'breeder' && u.role !== 'admin')) throw new Error('Only breeders and admins can change photos.');
+  const m = /^data:(image\/(?:jpeg|png|webp));base64,(.+)$/.exec(String(dataUrl || ''));
+  if (!m) throw new Error('Unsupported image format. Use a JPG, PNG or WebP photo.');
+  if (m[2].length > 12 * 1024 * 1024) throw new Error('Image is too large (max about 9 MB).');
+
+  const ext = m[1].split('/')[1].replace('jpeg', 'jpg');
+  const name = key.replace('|', '_') + '_' + Date.now() + '.' + ext;
+  const file = getDatasetFolder_().createFile(Utilities.newBlob(Utilities.base64Decode(m[2]), m[1], name));
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+
+  const lock = LockService.getScriptLock(); lock.waitLock(20000);
+  try {
+    const s = sh('Media'), v = s.getDataRange().getValues();
+    const row = v.findIndex((r, i) => i > 0 && r[0] === key);
+    const url = 'https://drive.google.com/thumbnail?id=' + file.getId() + '&sz=w800';
+    if (row > 0) {
+      const oldId = v[row][2];
+      if (oldId) { try { DriveApp.getFileById(oldId).setTrashed(true); } catch (e) {} }
+      s.getRange(row + 1, 2, 1, 2).setValues([[url, file.getId()]]);
+    } else {
+      s.appendRow([key, url, file.getId()]);
+    }
+    return {url: url, name: name};
+  } finally { lock.releaseLock(); }
+}
+
+// ===== DASHBOARD (admin only, one-hour token from login) =====
+
+function getDashboardData(token) {
+  const actor = CacheService.getScriptCache().get('dashboard:' + String(token || ''));
+  if (!actor) throw new Error('Admin login required. Please log in again.');
+  requireAdmin_(actor);
+
+  const now = Date.now();
+  const userRows = sh('Users').getDataRange().getValues().slice(1).filter(r => r[0]);
+  const byRole = {purchaser: 0, buyer: 0, breeder: 0, enthusiast: 0, farmowner: 0, admin: 0};
+  userRows.forEach(r => { if (byRole[r[1]] !== undefined) byRole[r[1]]++; });
+
+  const lots = readJson_('Lots'), orders = readJson_('Orders'), res = readRes_();
+  const received = orders.filter(o => o.status === 'Received');
+  const confirmed = res.filter(r => r.status === 'Confirmed');
+  const live = lots.filter(l => l.left > 0 && now < l.exp);
+  const bySpecies = {};
+  received.forEach(o => { bySpecies[o.sp] = (bySpecies[o.sp] || 0) + o.qty; });
+
+  const activity = sh('Activity').getDataRange().getValues().slice(1)
+    .filter(r => r[0]).slice(-40).reverse()
+    .map(r => [fmt_(r[0]), r[1], r[2], r[3], r[4]]);
+
+  return {
+    updated: fmt_(now),
+    users: {
+      total: userRows.length, byRole: byRole,
+      list: userRows.slice(-100).reverse().map(r => [r[0], r[1], r[2], String(r[3] || ''), String(r[4] || ''), fmt_(r[7])])
+    },
+    orders: {
+      total: orders.length,
+      pending: orders.filter(o => o.status === 'Awaiting Payment').length,
+      paid: orders.filter(o => o.status === 'Paid – Awaiting Receipt').length,
+      revenue: received.reduce((a, o) => a + (o.total || 0), 0),
+      list: orders.slice(-50).reverse().map(o => [o.id, o.buyerName || o.buyer, o.sp, o.qty, o.total, o.status, fmt_(o.created)])
+    },
+    inventory: {
+      listings: live.length,
+      pupae: live.reduce((a, l) => a + l.left, 0),
+      expiring: live.filter(l => l.exp - now < SOON).length,
+      list: lots.slice(-50).reverse().map(l => [l.sp, l.breeder, l.qty, l.left, l.price, fmt_(l.exp)])
+    },
+    reservations: {
+      total: res.length,
+      pending: res.filter(r => r.status === 'Awaiting Approval' || r.status === 'Payment Submitted' || r.status === 'Pending Payment').length,
+      confirmed: confirmed.length,
+      revenue: confirmed.reduce((a, r) => a + (r.total || 0), 0),
+      list: res.slice(-50).reverse().map(r => [r.ref, r.name, r.farm, r.date, r.slot, r.n, r.total, r.status])
+    },
+    salesRecord: received.slice()
+      .sort((a, b) => (b.receivedAt || b.created || 0) - (a.receivedAt || a.created || 0))
+      .map(o => ({id: o.id, date: o.receivedAt || o.created, sp: o.sp, qty: o.qty, price: o.price,
+        total: o.total, breeder: o.breeder, sellerName: o.sellerName || o.breeder,
+        buyer: o.buyer, buyerName: o.buyerName || o.buyer})),
+    sales: bySpecies,
+    activity: activity
+  };
+}
+
+// ===== END OF CODE.GS =====
